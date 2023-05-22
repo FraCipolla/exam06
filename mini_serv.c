@@ -1,109 +1,224 @@
 #include <string.h>
-#include <unistd.h>
-#include <stdlib.h>
 #include <stdio.h>
-#include <sys/types.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/select.h>
-#include <arpa/inet.h>
-#include <string.h>
+#include <netinet/in.h>
 
-typedef struct s_client {
-    int id;
-    char msg[1024];
-}   t_clients;
-
-fd_set master, read_fds, write_fds;
-
-void fatal(char *str)
+typedef struct		s_client 
 {
-    write(2, str, strlen(str));
-    exit(1);
+	int				fd;
+    int             id;
+	struct s_client	*next;
+}	t_client;
+
+t_client *g_clients = NULL;
+
+int sock_fd, g_id = 0;
+fd_set curr_sock, cpy_read, cpy_write;
+char msg[42];
+char str[42*4096], tmp[42*4096], buf[42*4096 + 42];
+
+void	fatal() 
+{
+	write(2, "Fatal error\n", strlen("Fatal error\n"));
+	close(sock_fd);
+	exit(1);
 }
 
-void sendAll(int n, int fdMax, char *str)
+int get_id(int fd)
 {
-    for (int i = 0; i <= fdMax; i++) {
-        if (FD_ISSET(i, &write_fds) && (i != n))
-            send(i, str, strlen(str), 0);
+    t_client *temp = g_clients;
+
+    while (temp)
+    {
+        if (temp->fd == fd)
+            return (temp->id);
+        temp = temp->next;
+    }
+    return (-1);
+}
+
+int		get_max_fd() 
+{
+	int	max = sock_fd;
+    t_client *temp = g_clients;
+
+    while (temp)
+    {
+        if (temp->fd > max)
+            max = temp->fd;
+        temp = temp->next;
+    }
+    return (max);
+}
+
+void	send_all(int fd, char *str_req)
+{
+    t_client *temp = g_clients;
+
+    while (temp)
+    {
+        if (temp->fd != fd && FD_ISSET(temp->fd, &cpy_write))
+        {
+            if (send(temp->fd, str_req, strlen(str_req), 0) < 0)
+                fatal();
+        }
+        temp = temp->next;
     }
 }
 
-int main(int argc, char *argv[])
+int		add_client_to_list(int fd)
 {
-    if (argc != 2)
-        fatal("wrong number of arguments\n");
-    t_clients   clients[1024];
-    int sockfd, client_fd, nbytes;
-    socklen_t len;
-    struct sockaddr_in servaddr, cli;
+    t_client *temp = g_clients;
+    t_client *new;
 
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-        fatal("Fatal error\n");
-    
+    if (!(new = calloc(1, sizeof(t_client))))
+        fatal();
+    new->id = g_id++;
+    new->fd = fd;
+    new->next = NULL;
+    if (!g_clients)
+    {
+        g_clients = new;
+    }
+    else
+    {
+        while (temp->next)
+            temp = temp->next;
+        temp->next = new;
+    }
+    return (new->id);
+}
+
+void add_client()
+{
+    struct sockaddr_in clientaddr;
+    socklen_t len = sizeof(clientaddr);
+    int client_fd;
+
+    if ((client_fd = accept(sock_fd, (struct sockaddr *)&clientaddr, &len)) < 0)
+        fatal();
+    sprintf(msg, "server: client %d just arrived\n", add_client_to_list(client_fd));
+    send_all(client_fd, msg);
+    FD_SET(client_fd, &curr_sock);
+}
+
+int rm_client(int fd)
+{
+    t_client *temp = g_clients;
+    t_client *del;
+    int id = get_id(fd);
+
+    if (temp && temp->fd == fd)
+    {
+        g_clients = temp->next;
+        free(temp);
+    }
+    else
+    {
+        while(temp && temp->next && temp->next->fd != fd)
+            temp = temp->next;
+        del = temp->next;
+        temp->next = temp->next->next;
+        free(del);
+    }
+    return (id);
+}
+
+void ex_msg(int fd)
+{
+    int i = 0;
+    int j = 0;
+
+    while (str[i])
+    {
+        tmp[j] = str[i];
+        j++;
+        if (str[i] == '\n')
+        {
+            sprintf(buf, "client %d: %s", get_id(fd), tmp);
+            send_all(fd, buf);
+            j = 0;
+            bzero(&tmp, strlen(tmp));
+            bzero(&buf, strlen(buf));
+        }
+        i++;
+    }
+    bzero(&str, strlen(str));
+}
+
+int main(int ac, char **av)
+{
+    if (ac != 2)
+    {
+        write(2, "Wrong number of arguments\n", strlen("Wrong number of arguments\n"));
+        exit(1);
+    }
+
+    struct sockaddr_in servaddr;
+    uint16_t port = atoi(av[1]);
     bzero(&servaddr, sizeof(servaddr));
-    FD_ZERO(&master);    // clear the master and temp sets
-    FD_ZERO(&read_fds);
-
-    // assign IP, PORT 
-	servaddr.sin_family = AF_INET; 
+    servaddr.sin_family = AF_INET; 
 	servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
-	servaddr.sin_port = htons(atoi(argv[1]));
+	servaddr.sin_port = htons(port);
 
-    // Binding newly created socket to given IP and verification 
-	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0)
-        fatal("Fatal error\n"); 
-
-	if (listen(sockfd, 10) != 0)
-        fatal("Fatal error\n");
-
-    FD_SET(sockfd, &master);
-    int fdmax = sockfd;
-    int index = 0;
-    char buff_read[12042];
-    char buff_write[12042];
-
-    for (;;) {
-        read_fds = write_fds = master;
-        if (select(fdmax + 1, &read_fds, &write_fds, NULL, NULL) == -1)
-            continue ;
-
-        // run through the existing connections looking for data to read
-        for(int i = 0; i <= fdmax; i++) {
-            if (FD_ISSET(i, &read_fds)) {
-                if (i == sockfd) {
-	                client_fd = accept(sockfd, (struct sockaddr *)&cli, &len);
-	                if (client_fd < 0)
-                        continue ;
-                    fdmax = client_fd > fdmax ? client_fd : fdmax;
-                    clients[client_fd].id = index++;
-                    FD_SET(client_fd, &master);
-                    sprintf(buff_write, "server: cient %d just arrived\n", clients[client_fd].id);
-                    sendAll(client_fd, fdmax, buff_write);
+    if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        fatal();
+    if (bind(sock_fd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+        fatal();
+    if (listen(sock_fd, 0) < 0)
+        fatal();
+    
+    FD_ZERO(&curr_sock);
+    FD_SET(sock_fd, &curr_sock);
+    bzero(&tmp, sizeof(tmp));
+    bzero(&buf, sizeof(buf));
+    bzero(&str, sizeof(str));
+    while(1)
+    {
+        cpy_write = cpy_read = curr_sock;
+        if (select(get_max_fd() + 1, &cpy_read, &cpy_write, NULL, NULL) < 0)
+            continue;
+        for (int fd = 0; fd <= get_max_fd(); fd++)
+        {
+            if (FD_ISSET(fd, &cpy_read))
+            {
+                if (fd == sock_fd)
+                {
+                    bzero(&msg, sizeof(msg));
+                    add_client();
                     break;
-                } else {
-                    if ((nbytes = recv(i, buff_read, 65536, 0)) <= 0) {
-                        sprintf(buff_write, "server: client %d just left\n", clients[i].id);
-                        sendAll(i, fdmax, buff_write);
-                        FD_CLR(i, &master);
-                        close(i);
-                        break ;
-                    } else {
-                        for (int j = 0, k = strlen(clients[i].msg); j < nbytes; j++, k++) {
-                            clients[i].msg[k] = buff_read[j];
-                            if (clients[i].msg[k] == '\n') {
-                                clients[i].msg[k] = '\0';
-                                sprintf(buff_write, "client %d: %s\n", clients[i].id, clients[i].msg);
-                                sendAll(i, fdmax, buff_write);
-                                bzero(&clients[i].msg, strlen(clients[i].msg));
-                                k = -1;
-                            }
-                        }
-                        break ;
+                }
+                else
+                {
+			int ret_recv = 1000;
+			while (ret_recv == 1000 || str[strlen(str) - 1] != '\n')
+			{
+				ret_recv = recv(fd, str + strlen(str), 1000, 0);
+				if (ret_recv <= 0)
+					break ;
+			}
+                    if (ret_recv <= 0)
+                    {
+                        bzero(&msg, sizeof(msg));
+                        sprintf(msg, "server: client %d just left\n", rm_client(fd));
+                        send_all(fd, msg);
+                        FD_CLR(fd, &curr_sock);
+                        close(fd);
+                        break;
+                    }
+                    else
+                    {
+                        ex_msg(fd);
                     }
                 }
             }
+            
         }
+        
     }
-    return 0;
+    return (0);
 }
